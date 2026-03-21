@@ -145,9 +145,16 @@ class LolibraryScraper:
                     last_time_str = state.get('last_scrape_time')
                     if last_time_str:
                         self.last_scrape_time = datetime.fromisoformat(last_time_str)
-                    self.current_page = state.get('current_page', 1)
+                    # 增量爬取时总是从第 1 页开始（最新商品），直到追上已抓取商品
+                    # 全量爬取时从上次页码继续
+                    is_incremental = self.last_scrape_time is not None
+                    if is_incremental:
+                        self.current_page = 1
+                        print(f"[OK] 增量爬取模式 - 从第 1 页开始，直到追上已抓取商品")
+                    else:
+                        self.current_page = state.get('current_page', 1)
+                        print(f"[OK] 全量爬取模式 - 从第 {self.current_page} 页继续")
                     self.total_items_scraped = state.get('total_items_scraped', 0)
-                    print(f"[OK] 恢复抓取 - 上次页码：{self.current_page}, 已抓取：{self.total_items_scraped} 个商品")
             except Exception as e:
                 print(f"[WARN] 加载状态失败：{e}，将从第 1 页开始")
                 self.current_page = 1
@@ -290,11 +297,13 @@ class LolibraryScraper:
                     except Exception as e:
                         print(f"[WARN] 解析时间失败：{e}")
             
-            # 检查是否需要跳过（增量模式）
+            # 增量模式下，不再仅通过时间判断跳过
+            # 而是通过数据库 URL 去重，确保不会漏掉全量期间新上架的商品
+            # （这些商品可能发布时间早于 last_scrape_time，但实际是新的）
             if published_time and self.last_scrape_time:
                 if published_time <= self.last_scrape_time:
-                    self.skipped_count += 1
-                    return None
+                    # 标记为"可能已抓取"，但仍返回数据让 save_item_to_db 通过 URL 判断
+                    pass  # 不跳过，继续处理
             
             # 提取品牌
             brand = None
@@ -362,8 +371,14 @@ class LolibraryScraper:
             print(f"[ERROR] 提取商品数据失败 {item_url}: {e}")
             return None
     
-    def save_item_to_db(self, item: Dict) -> bool:
-        """保存商品到数据库（带事务保护）"""
+    def save_item_to_db(self, item: Dict, is_full_scrape: bool = False) -> bool:
+        """
+        保存商品到数据库（带事务保护）
+        
+        Args:
+            item: 商品数据
+            is_full_scrape: 是否全量模式（全量模式下重复不报错）
+        """
         if not self.db_conn:
             return False
         
@@ -373,6 +388,9 @@ class LolibraryScraper:
             # 检查商品是否已存在
             cursor.execute('SELECT id FROM lolibrary_items WHERE url = ?', (item['url'],))
             if cursor.fetchone():
+                # 已存在，全量模式下这是正常的
+                if is_full_scrape:
+                    print(f"  [SKIP] 已存在：{item['name'][:40]}...")
                 return False
             
             # 生成 UUID 长整数 ID
@@ -433,11 +451,13 @@ class LolibraryScraper:
         print(f"\n[{datetime.now()}] 开始抓取...")
         print(f"从第 {self.current_page} 页开始")
         print(f"延迟：{self.delay}秒/请求")
-        print(f"模式：{'全量' if self.last_scrape_time is None else '增量'}\n")
+        is_full_scrape = self.last_scrape_time is None
+        print(f"模式：{'全量' if is_full_scrape else '增量'}\n")
         
         total_new = 0
         consecutive_no_data = 0
         consecutive_skipped = 0
+        is_incremental = not is_full_scrape
         
         try:
             while True:
@@ -464,6 +484,7 @@ class LolibraryScraper:
                 new_on_page = 0
                 skipped_on_page = 0
                 self.items_in_page = 0
+                is_full_scrape = self.last_scrape_time is None
                 
                 for i, url in enumerate(urls, 1):
                     if max_items and total_new >= max_items:
@@ -471,14 +492,16 @@ class LolibraryScraper:
                     
                     data = self.extract_item_data(url)
                     if data:
-                        if self.save_item_to_db(data):
+                        if self.save_item_to_db(data, is_full_scrape=is_full_scrape):
                             total_new += 1
                             new_on_page += 1
                             self.total_items_scraped += 1
                             print(f"  [{i}/{len(urls)}] OK - {data['name'][:40]}... ({len(data['image_urls'])}张图片)")
                         else:
+                            # 全量模式下重复不算连续跳过
                             skipped_on_page += 1
-                            consecutive_skipped += 1
+                            if not is_full_scrape:
+                                consecutive_skipped += 1
                     else:
                         skipped_on_page += 1
                     
@@ -490,9 +513,10 @@ class LolibraryScraper:
                 # 保存状态
                 self._save_state()
                 
-                # 如果连续跳过太多，可能已经抓完了
-                if consecutive_skipped >= 100:
-                    print("[INFO] 连续跳过 100 个商品，可能已抓取完毕")
+                # 如果连续跳过太多，可能已经抓完了（仅增量模式）
+                # 阈值设为 100，确保多爬几页直到确认都是已爬过的商品
+                if is_incremental and consecutive_skipped >= 100:
+                    print("[INFO] 连续跳过 100 个商品，已抓取完毕（含全量期间新上架商品）")
                     break
                 
                 # 进入下一页
